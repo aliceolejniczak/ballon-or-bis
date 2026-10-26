@@ -375,14 +375,18 @@ if selected_id:
                         st.error("Chaque joueur doit choisir 10 noms différents.")
                     else:
                         try:
-                            db.table("picks").delete().eq("game_id", game["id"]).eq("player_id", profile["id"]).execute()
                             payload = [{
                                 "game_id": game["id"],
                                 "player_id": profile["id"],
                                 "predicted_rank": rank,
                                 "nominee_name": nominee,
                             } for rank, nominee in enumerate(chosen, start=1)]
-                            db.table("picks").insert(payload).execute()
+                            # Update existing ranks and insert missing ones without deleting first.
+                            # Requires the composite unique constraint on (game_id, player_id, predicted_rank).
+                            db.table("picks").upsert(
+                                payload,
+                                on_conflict="game_id,player_id,predicted_rank",
+                            ).execute()
                             st.success("Pronostics enregistrés !")
                             st.rerun()
                         except Exception as e:
