@@ -321,7 +321,7 @@ try:
             if game["status"] == "closed":
                 status_label = "🏁 Terminée"
             elif bool(game.get("predictions_locked", False)):
-                status_label = "🔒 Pronostics verrouillés · classement révélé"
+                status_label = "🔒 Pronostics verrouillés · classement officiel à venir" if not bool(game.get("official_revealed", False)) else "🔒 Pronostics verrouillés · classement révélé"
             else:
                 status_label = "🟢 En cours · pronostics ouverts"
             st.caption(f"{status_label} · Code : {game['code']} · {len(member_rows)} joueur(s)" + (" · Admin" if is_admin else ""))
@@ -358,7 +358,7 @@ if selected_id:
             predictions_locked = bool(game.get("predictions_locked", False))
             if game["status"] != "open" or predictions_locked:
                 if predictions_locked and game["status"] == "open":
-                    st.info("🔒 Les pronostics sont verrouillés. Le classement officiel est révélé, mais les scores finaux restent masqués jusqu’à la clôture.")
+                    st.info("🔒 Les pronostics sont verrouillés. Le classement officiel sera révélé après sa saisie par l’admin ; les scores restent masqués jusqu’à la clôture.")
                 else:
                     st.info("Cette partie est clôturée : les pronostics ne sont plus modifiables.")
             else:
@@ -402,16 +402,33 @@ if selected_id:
             predictions_locked = bool(game.get("predictions_locked", False))
 
             if is_admin:
-                st.caption("Tu es l’admin de cette partie. Tant que les pronostics ne sont pas verrouillés, le classement officiel reste un brouillon modifiable par toi seul.")
                 if game["status"] == "open" and not predictions_locked:
+                    st.info("Étape 1 : les joueurs terminent leurs pronostics. Tu peux verrouiller les pronostics quand tu es prêt·e ; le classement officiel sera saisi ensuite.")
+                    st.write(f"Pronostics complets : {sum(1 for m in members if len(player_picks(game['id'], m['player_id'])) == 10)}/{len(members)} joueurs.")
+                    if st.button("🔒 Verrouiller les pronostics de tous les joueurs", key=f"lock_{game['id']}", width="stretch"):
+                        try:
+                            db.table("games").update({"predictions_locked": True, "official_revealed": False}).eq("id", game["id"]).eq("status", "open").execute()
+                            st.success("Pronostics verrouillés ! Tu peux maintenant saisir le classement officiel.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Verrouillage impossible. Vérifie que la colonne predictions_locked existe dans Supabase. Détail : {e}")
+
+                elif predictions_locked and game["status"] == "open":
+                    st.success("🔒 Les pronostics sont verrouillés. Les joueurs ne peuvent plus les modifier.")
+                    st.caption("Étape 2 : saisis maintenant le classement officiel. Il sera révélé aux joueurs une fois enregistré.")
                     old_by_rank = {int(r["rank"]): r["nominee_name"] for r in results}
                     with st.form(f"official_{game['id']}"):
                         official_chosen = []
                         for rank in range(1, 11):
                             old_name = old_by_rank.get(rank, NOMINEES[rank - 1])
                             old_index = NOMINEES.index(old_name) if old_name in NOMINEES else rank - 1
-                            official_chosen.append(st.selectbox(f"Classement officiel — {rank}ᵉ", NOMINEES, index=old_index, key=f"official_pick_{game['id']}_{rank}"))
-                        save_official = st.form_submit_button("Enregistrer / modifier le classement officiel", width="stretch")
+                            official_chosen.append(st.selectbox(
+                                f"Classement officiel — {rank}ᵉ",
+                                NOMINEES,
+                                index=old_index,
+                                key=f"official_pick_{game['id']}_{rank}",
+                            ))
+                        save_official = st.form_submit_button("Enregistrer et révéler le classement officiel", width="stretch")
                     if save_official:
                         if len(set(official_chosen)) != 10:
                             st.error("Le classement officiel doit contenir 10 noms différents.")
@@ -421,49 +438,40 @@ if selected_id:
                                 db.table("official_results").insert([{
                                     "game_id": game["id"], "rank": rank, "nominee_name": nominee
                                 } for rank, nominee in enumerate(official_chosen, start=1)]).execute()
-                                st.success("Classement officiel enregistré en brouillon. Il n’est pas encore visible des autres joueurs.")
+                                db.table("games").update({"official_revealed": True}).eq("id", game["id"]).eq("predictions_locked", True).execute()
+                                st.success("Classement officiel enregistré et révélé à tous les joueurs.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Enregistrement du classement impossible : {e}")
 
-                    st.write(f"Pronostics complets : {sum(1 for m in members if len(player_picks(game['id'], m['player_id'])) == 10)}/{len(members)} joueurs.")
-                    if len(results) == 10:
-                        st.warning("Le verrouillage est définitif : tous les joueurs ne pourront plus modifier leur Top 10 et le classement officiel sera révélé.")
-                        if st.button("🔒 Verrouiller les pronostics et révéler le classement réel", key=f"lock_{game['id']}", width="stretch"):
+                    if len(results) == 10 and bool(game.get("official_revealed", False)):
+                        st.warning("Le classement officiel est enregistré. Tu peux maintenant clôturer la partie pour afficher les scores finaux.")
+                        if st.button("🏁 Clôturer la partie et afficher les scores finaux", key=f"close_{game['id']}", width="stretch"):
                             try:
-                                db.table("games").update({"predictions_locked": True}).eq("id", game["id"]).eq("status", "open").execute()
-                                st.success("Pronostics verrouillés et classement officiel révélé !")
+                                db.table("games").update({"status": "closed", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", game["id"]).eq("predictions_locked", True).eq("official_revealed", True).execute()
+                                st.success("Partie clôturée. Les scores finaux sont maintenant disponibles.")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Verrouillage impossible. Vérifie que la colonne predictions_locked a été ajoutée dans Supabase. Détail : {e}")
-                    else:
-                        st.info("Enregistre d’abord les 10 places officielles pour pouvoir verrouiller les pronostics.")
-                elif predictions_locked and game["status"] == "open":
-                    st.success("🔒 Pronostics verrouillés. Le classement réel est révélé ; les scores finaux seront affichés à la clôture.")
-                    if len(results) == 10 and st.button("🏁 Clôturer la partie et afficher les scores finaux", key=f"close_{game['id']}", width="stretch"):
-                        try:
-                            db.table("games").update({"status": "closed", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", game["id"]).execute()
-                            st.success("Partie clôturée. Les scores finaux sont maintenant disponibles.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Clôture impossible : {e}")
+                                st.error(f"Clôture impossible : {e}")
                 elif game["status"] == "closed":
-                    st.success("Cette partie est clôturée : pronostics et classement officiel sont verrouillés.")
-            elif not predictions_locked:
-                st.info("Le classement officiel est masqué jusqu’à ce que l’admin verrouille les pronostics. Cela évite d’influencer les choix des joueurs.")
+                    st.success("Cette partie est clôturée : les pronostics et le classement officiel sont verrouillés.")
 
-            # The real ranking is visible to everyone only after the admin locks the predictions.
-            if predictions_locked or game["status"] == "closed":
-                if results:
-                    st.markdown("#### Classement officiel révélé")
-                    for result in results:
-                        st.write(f"**{result['rank']}.** {result['nominee_name']}")
-                else:
-                    st.warning("Le classement officiel n’a pas encore été renseigné.")
-            elif is_admin and results:
-                st.caption("Aperçu privé du classement officiel (visible uniquement par l’admin avant le verrouillage).")
+            # The official ranking stays hidden from everyone except the admin until it has been entered after locking.
+            if predictions_locked and bool(game.get("official_revealed", False)) and len(results) == 10:
+                st.markdown("#### Classement officiel révélé")
                 for result in results:
                     st.write(f"**{result['rank']}.** {result['nominee_name']}")
+            elif is_admin and results and not predictions_locked:
+                st.caption("Brouillon privé de classement officiel. Les joueurs ne le voient pas.")
+                for result in results:
+                    st.write(f"**{result['rank']}.** {result['nominee_name']}")
+            elif not is_admin and not predictions_locked:
+                st.info("Le classement officiel sera saisi après le verrouillage des pronostics et restera masqué jusque-là.")
+            elif predictions_locked and (not bool(game.get("official_revealed", False)) or len(results) != 10):
+                if is_admin:
+                    st.info("Les pronostics sont verrouillés. Le classement officiel n’a pas encore été enregistré.")
+                else:
+                    st.info("Les pronostics sont verrouillés. Le classement officiel sera révélé dès que l’administrateur l’aura saisi et enregistré.")
 
         with leaderboard_tab:
             st.subheader("Classement des joueurs")
