@@ -120,20 +120,36 @@ def player_picks(game_id: str, player_id: str):
     )
 
 
-def calculate_score(picks, results):
+def pick_score_details(picks, results):
+    """Return the per-pick scoring breakdown using the same rules as calculate_score."""
     if len(results) != 10:
         return None
     actual = {r["nominee_name"]: int(r["rank"]) for r in results}
-    score = 0
-    for pick in picks:
+    details = []
+    for pick in sorted(picks, key=lambda x: int(x["predicted_rank"])):
         predicted_rank = int(pick["predicted_rank"])
         nominee = pick["nominee_name"]
         if nominee in actual:
             actual_rank = actual[nominee]
-            score += max(0, BASE_POINTS[actual_rank] - 3 * abs(predicted_rank - actual_rank))
+            points = max(0, BASE_POINTS[actual_rank] - 3 * abs(predicted_rank - actual_rank))
+            actual_label = f"{actual_rank}e"
         else:
-            score -= 2
-    return score
+            points = -2
+            actual_label = "Hors Top 10"
+        details.append({
+            "Place prédite": predicted_rank,
+            "Joueur pronostiqué": nominee,
+            "Place officielle": actual_label,
+            "Points gagnés": points,
+        })
+    return details
+
+
+def calculate_score(picks, results):
+    details = pick_score_details(picks, results)
+    if details is None:
+        return None
+    return sum(row["Points gagnés"] for row in details)
 
 
 def game_link(code: str):
@@ -228,8 +244,8 @@ if join_code:
             game = get_game(str(join_code))
             if not game:
                 st.error("Cette partie n’existe pas (ou le code est incorrect).")
-            elif game["status"] != "open":
-                st.warning("Cette partie est terminée ou fermée : elle reste consultable si tu en es membre.")
+            elif game["status"] != "open" or bool(game.get("predictions_locked", False)):
+                st.warning("Cette partie n’accepte plus de nouveaux joueurs : les pronostics sont verrouillés ou la partie est terminée.")
             else:
                 add_member(game["id"], profile["id"])
                 st.session_state.selected_game_id = game["id"]
@@ -272,8 +288,8 @@ with join_tab:
             game = get_game(code_to_join)
             if not game:
                 st.error("Code introuvable. Vérifie le code d’invitation.")
-            elif game["status"] != "open":
-                st.error("Cette partie est fermée.")
+            elif game["status"] != "open" or bool(game.get("predictions_locked", False)):
+                st.error("Cette partie n’accepte plus de nouveaux joueurs : les pronostics sont verrouillés ou la partie est fermée.")
             else:
                 add_member(game["id"], profile["id"])
                 st.session_state.selected_game_id = game["id"]
@@ -282,17 +298,17 @@ with join_tab:
         except Exception as e:
             st.error(f"Impossible de rejoindre la partie : {e}")
 
-# Dashboard: every open game the player belongs to
+# Dashboard: show both open and closed games the player belongs to
 st.divider()
-st.header("Mes parties en cours")
+st.header("Mes parties")
 try:
     memberships = rows("game_players", player_id=profile["id"])
     member_game_ids = [m["game_id"] for m in memberships]
     games = []
     if member_game_ids:
-        games = db.table("games").select("*").in_("id", member_game_ids).eq("status", "open").order("created_at", desc=True).execute().data or []
+        games = db.table("games").select("*").in_("id", member_game_ids).order("created_at", desc=True).execute().data or []
     if not games:
-        st.caption("Aucune partie en cours pour le moment. Crée une partie ou rejoins-en une avec un code.")
+        st.caption("Tu n’as pas encore de partie. Crée-en une ou rejoins-en une avec un code.")
     for game in games:
         member_rows = rows("game_players", game_id=game["id"])
         member_ids = [m["player_id"] for m in member_rows]
@@ -302,9 +318,16 @@ try:
         is_admin = game["admin_player_id"] == profile["id"]
         with st.container(border=True):
             st.subheader(game["name"])
-            st.caption(f"Code : {game['code']} · {len(member_rows)} joueur(s)" + (" · Admin" if is_admin else ""))
+            if game["status"] == "closed":
+                status_label = "🏁 Terminée"
+            elif bool(game.get("predictions_locked", False)):
+                status_label = "🔒 Pronostics verrouillés · classement révélé"
+            else:
+                status_label = "🟢 En cours · pronostics ouverts"
+            st.caption(f"{status_label} · Code : {game['code']} · {len(member_rows)} joueur(s)" + (" · Admin" if is_admin else ""))
             st.write("Joueurs : " + ", ".join(p["nickname"] for p in people))
-            if st.button("Ouvrir la partie", key=f"open_{game['id']}", width="stretch"):
+            button_label = "Ouvrir la partie" if game["status"] == "open" else "Voir les résultats"
+            if st.button(button_label, key=f"open_{game['id']}", width="stretch"):
                 st.session_state.selected_game_id = game["id"]
                 st.rerun()
 except Exception as e:
@@ -332,10 +355,14 @@ if selected_id:
             st.subheader("Classe ton Top 10")
             current_picks = player_picks(game["id"], profile["id"])
             existing_by_rank = {int(p["predicted_rank"]): p["nominee_name"] for p in current_picks}
-            if game["status"] != "open":
-                st.info("Cette partie est fermée : les pronostics ne sont plus modifiables.")
+            predictions_locked = bool(game.get("predictions_locked", False))
+            if game["status"] != "open" or predictions_locked:
+                if predictions_locked and game["status"] == "open":
+                    st.info("🔒 Les pronostics sont verrouillés. Le classement officiel est révélé, mais les scores finaux restent masqués jusqu’à la clôture.")
+                else:
+                    st.info("Cette partie est clôturée : les pronostics ne sont plus modifiables.")
             else:
-                st.caption("Chaque joueur peut choisir 10 noms distincts. Tu peux modifier tes choix tant que la partie est ouverte.")
+                st.caption("Chaque joueur peut choisir 10 noms distincts. Tes choix restent modifiables jusqu’au verrouillage par l’admin.")
                 with st.form(f"picks_{game['id']}"):
                     chosen = []
                     for rank in range(1, 11):
@@ -368,9 +395,11 @@ if selected_id:
         with results_tab:
             st.subheader("Classement officiel du Ballon d’Or")
             results = official_results(game["id"])
+            predictions_locked = bool(game.get("predictions_locked", False))
+
             if is_admin:
-                st.success("Tu es l’admin : seul ton profil peut modifier le classement officiel.")
-                if game["status"] == "open":
+                st.caption("Tu es l’admin de cette partie. Tant que les pronostics ne sont pas verrouillés, le classement officiel reste un brouillon modifiable par toi seul.")
+                if game["status"] == "open" and not predictions_locked:
                     old_by_rank = {int(r["rank"]): r["nominee_name"] for r in results}
                     with st.form(f"official_{game['id']}"):
                         official_chosen = []
@@ -388,41 +417,87 @@ if selected_id:
                                 db.table("official_results").insert([{
                                     "game_id": game["id"], "rank": rank, "nominee_name": nominee
                                 } for rank, nominee in enumerate(official_chosen, start=1)]).execute()
-                                st.success("Classement officiel enregistré.")
+                                st.success("Classement officiel enregistré en brouillon. Il n’est pas encore visible des autres joueurs.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Enregistrement du classement impossible : {e}")
-                if game["status"] == "open":
-                    if st.button("Clôturer la partie", key=f"close_{game['id']}"):
-                        db.table("games").update({"status": "closed", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", game["id"]).execute()
-                        st.success("Partie clôturée. Les pronostics et le classement officiel sont désormais verrouillés.")
-                        st.rerun()
-            else:
-                st.caption("Seul l’admin de cette partie peut saisir ou modifier le classement officiel.")
-            if results:
+
+                    st.write(f"Pronostics complets : {sum(1 for m in members if len(player_picks(game['id'], m['player_id'])) == 10)}/{len(members)} joueurs.")
+                    if len(results) == 10:
+                        st.warning("Le verrouillage est définitif : tous les joueurs ne pourront plus modifier leur Top 10 et le classement officiel sera révélé.")
+                        if st.button("🔒 Verrouiller les pronostics et révéler le classement réel", key=f"lock_{game['id']}", width="stretch"):
+                            try:
+                                db.table("games").update({"predictions_locked": True}).eq("id", game["id"]).eq("status", "open").execute()
+                                st.success("Pronostics verrouillés et classement officiel révélé !")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Verrouillage impossible. Vérifie que la colonne predictions_locked a été ajoutée dans Supabase. Détail : {e}")
+                    else:
+                        st.info("Enregistre d’abord les 10 places officielles pour pouvoir verrouiller les pronostics.")
+                elif predictions_locked and game["status"] == "open":
+                    st.success("🔒 Pronostics verrouillés. Le classement réel est révélé ; les scores finaux seront affichés à la clôture.")
+                    if len(results) == 10 and st.button("🏁 Clôturer la partie et afficher les scores finaux", key=f"close_{game['id']}", width="stretch"):
+                        try:
+                            db.table("games").update({"status": "closed", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", game["id"]).execute()
+                            st.success("Partie clôturée. Les scores finaux sont maintenant disponibles.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Clôture impossible : {e}")
+                elif game["status"] == "closed":
+                    st.success("Cette partie est clôturée : pronostics et classement officiel sont verrouillés.")
+            elif not predictions_locked:
+                st.info("Le classement officiel est masqué jusqu’à ce que l’admin verrouille les pronostics. Cela évite d’influencer les choix des joueurs.")
+
+            # The real ranking is visible to everyone only after the admin locks the predictions.
+            if predictions_locked or game["status"] == "closed":
+                if results:
+                    st.markdown("#### Classement officiel révélé")
+                    for result in results:
+                        st.write(f"**{result['rank']}.** {result['nominee_name']}")
+                else:
+                    st.warning("Le classement officiel n’a pas encore été renseigné.")
+            elif is_admin and results:
+                st.caption("Aperçu privé du classement officiel (visible uniquement par l’admin avant le verrouillage).")
                 for result in results:
                     st.write(f"**{result['rank']}.** {result['nominee_name']}")
-            else:
-                st.info("Le classement officiel n’a pas encore été renseigné.")
 
         with leaderboard_tab:
             st.subheader("Classement des joueurs")
             results = official_results(game["id"])
-            leaderboard = []
-            for member in members:
-                pid = member["player_id"]
-                picks = player_picks(game["id"], pid)
-                score = calculate_score(picks, results) if len(picks) == 10 else None
-                leaderboard.append({
-                    "Joueur": nickname_by_id.get(pid, "Joueur"),
-                    "Pronostics validés": "Oui" if len(picks) == 10 else f"{len(picks)}/10",
-                    "Points": score if score is not None else "En attente",
-                })
-            leaderboard.sort(key=lambda x: x["Points"] if isinstance(x["Points"], int) else -10**9, reverse=True)
-            st.dataframe(leaderboard, hide_index=True, width="stretch")
-            if len(results) == 10:
-                st.caption("Barème : 20, 15, 12, 10, 8, 6, 5, 4, 3, 2 points selon la place réelle, moins 3 points par place d’écart (minimum 0) ; −2 points pour un joueur hors du Top 10 officiel.")
+            if game["status"] != "closed":
+                if bool(game.get("predictions_locked", False)):
+                    st.info("Les pronostics sont verrouillés et le classement officiel est révélé. Les scores et le classement des joueurs seront affichés lorsque l’admin clôturera la partie.")
+                else:
+                    st.info("Les scores restent masqués jusqu’à la clôture de la partie, après verrouillage des pronostics et révélation du classement officiel.")
+            elif len(results) == 10:
+                leaderboard = []
+                for member in members:
+                    pid = member["player_id"]
+                    picks = player_picks(game["id"], pid)
+                    score = calculate_score(picks, results) if len(picks) == 10 else None
+                    leaderboard.append({
+                        "Joueur": nickname_by_id.get(pid, "Joueur"),
+                        "Pronostics validés": "Oui" if len(picks) == 10 else f"{len(picks)}/10",
+                        "Points": score if score is not None else "Non calculable (Top 10 incomplet)",
+                    })
+                leaderboard.sort(key=lambda x: x["Points"] if isinstance(x["Points"], int) else -10**9, reverse=True)
+                st.dataframe(leaderboard, hide_index=True, width="stretch")
+                st.caption("Barème : 20, 15, 12, 10, 8, 6, 5, 4, 3, 2 points selon la place officielle, moins 3 points par place d’écart (minimum 0) ; −2 points pour un nom hors du Top 10 officiel.")
+                st.markdown("#### Détail des pronostics de chaque joueur")
+                for member in members:
+                    pid = member["player_id"]
+                    player_name = nickname_by_id.get(pid, "Joueur")
+                    picks = player_picks(game["id"], pid)
+                    if len(picks) == 10:
+                        details = pick_score_details(picks, results)
+                        total = sum(row["Points gagnés"] for row in details)
+                        with st.expander(f"{player_name} — {total} points"):
+                            st.dataframe(details, hide_index=True, width="stretch")
+                    else:
+                        with st.expander(f"{player_name} — pronostics incomplets"):
+                            st.write(f"Ce joueur a enregistré {len(picks)}/10 pronostics. Son score ne peut pas encore être calculé.")
             else:
-                st.caption("Les scores seront calculés quand l’admin aura enregistré les 10 places officielles.")
+                st.warning("La partie est clôturée, mais le classement officiel ne contient pas 10 places. Contacte l’admin.")
+
 else:
-    st.caption("Choisis une partie dans « Mes parties en cours » pour voir tes pronostics, le classement officiel et les scores.")
+    st.caption("Choisis une partie dans « Mes parties » pour voir tes pronostics, le classement officiel et les scores.")
